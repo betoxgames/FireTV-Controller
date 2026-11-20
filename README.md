@@ -1,6 +1,14 @@
 # FireTV Controller
 
-Descarga la aplicación desde Releases. Requiere macOS 13 o posterior y Android Platform Tools (ADB) instalado, por ejemplo con `brew install android-platform-tools`. Abre `ControlRemoto.app`, pulsa el engrane e introduce la dirección IP de tu propio dispositivo y su puerto ADB. La app guarda la dirección únicamente en las preferencias locales y se reconecta automáticamente. No solicita permisos de accesibilidad ni captura las teclas de otras aplicaciones.
+## Instalación rápida
+
+1. Descarga el ZIP listo para usar desde [Releases v1.0](https://github.com/betoxgames/FireTV-Controller/releases/tag/v1.0) y descomprímelo.
+2. Abre `Instalar-dependencias.command` para descargar las herramientas ADB oficiales; si ya tienes ADB, no instala nada.
+3. Abre `ControlRemoto.app`, pulsa el engrane e introduce la IP de tu propio dispositivo y su puerto ADB.
+
+Requiere macOS 13 o posterior. No necesitas Xcode ni compilar nada. La app guarda la dirección únicamente en las preferencias locales y se reconecta automáticamente. No solicita permisos de accesibilidad ni captura las teclas de otras aplicaciones.
+
+También puedes instalar ADB por separado con `brew install android-platform-tools` o desde [Android Platform Tools](https://developer.android.com/tools/releases/platform-tools). La app no está notarizada; si macOS muestra una advertencia, consulta [la documentación de Apple](https://support.apple.com/es-mx/102445) antes de decidir si autorizas la apertura.
 
 ## Modo rápido (v2)
 
