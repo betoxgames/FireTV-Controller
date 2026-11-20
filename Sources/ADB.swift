@@ -13,6 +13,62 @@ struct ADBResult {
 }
 
 struct ADB {
+    enum PowerState: Equatable { case awake, asleep, unknown }
+    enum WakeResult: Equatable { case awake, asleep, sent, failed }
+
+    static func powerState(_ report: String) -> PowerState {
+        if report.contains("mWakefulness=Asleep") || report.contains("mWakefulness=Dozing") ||
+            report.contains("mWakefulness=Dreaming") || report.contains("Display Power: state=OFF") {
+            return .asleep
+        }
+        if report.contains("mWakefulness=Awake") || report.contains("Display Power: state=ON") {
+            return .awake
+        }
+        return .unknown
+    }
+
+    private static func readPower(_ binary: String, target: String,
+                                  runCommand: (String, [String], TimeInterval) -> ADBResult) -> PowerState {
+        let report = runCommand(binary, ["-s", target, "shell", "dumpsys power | grep -E 'mWakefulness=|Display Power: state='"], 2)
+        return report.ok ? powerState(report.output) : .unknown
+    }
+
+    /// Use explicit wake and sleep events rather than a blind power toggle.
+    static func wake(_ binary: String, target: String,
+                     runCommand: (String, [String], TimeInterval) -> ADBResult = ADB.run,
+                     pause: (TimeInterval) -> Void = Thread.sleep(forTimeInterval:)) -> WakeResult {
+        setPower(binary, target: target, desired: .awake, runCommand: runCommand, pause: pause)
+    }
+
+    static func togglePower(_ binary: String, target: String,
+                            runCommand: (String, [String], TimeInterval) -> ADBResult = ADB.run,
+                            pause: (TimeInterval) -> Void = Thread.sleep(forTimeInterval:)) -> WakeResult {
+        let current = readPower(binary, target: target, runCommand: runCommand)
+        // If the device cannot report its state, prefer waking over sleeping
+        // an active TV without knowing whether it is in use.
+        return setPower(binary, target: target, desired: current == .awake ? .asleep : .awake,
+                        runCommand: runCommand, pause: pause)
+    }
+
+    private static func setPower(_ binary: String, target: String, desired: PowerState,
+                                 runCommand: (String, [String], TimeInterval) -> ADBResult,
+                                 pause: (TimeInterval) -> Void) -> WakeResult {
+        let key = desired == .asleep ? "KEYCODE_SLEEP" : "KEYCODE_WAKEUP"
+        for attempt in 0..<2 {
+            let result = runCommand(binary, ["-s", target, "shell", "input keyevent \(key)"], 5)
+            if result.ok && !result.output.hasPrefix("Error:") {
+                for poll in 0..<3 {
+                    if poll > 0 { pause(0.3) }
+                    let observed = readPower(binary, target: target, runCommand: runCommand)
+                    if observed == desired { return desired == .asleep ? .asleep : .awake }
+                    if observed == .unknown { return .sent }
+                }
+            }
+            if attempt == 0 { pause(0.2) }
+        }
+        return .failed
+    }
+
     static var installedLocation: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("FireTV Controller/platform-tools", isDirectory: true)
@@ -106,6 +162,21 @@ struct ADB {
         }
         return (commands, plain != input)
     }
+
+    struct TextDelta: Equatable {
+        let erase: Int
+        let append: String
+        var isEmpty: Bool { erase == 0 && append.isEmpty }
+    }
+
+    // The local field owns only the text entered during this writing session.
+    // Reuse the common prefix and modify the suffix, never resend that prefix.
+    static func textDelta(from acknowledged: String, to desired: String) -> TextDelta {
+        let old = Array(acknowledged)
+        let new = Array(desired)
+        let prefix = zip(old, new).prefix(while: { $0.0 == $0.1 }).count
+        return TextDelta(erase: old.count - prefix, append: String(new.dropFirst(prefix)))
+    }
 }
 
 enum LinkState: Equatable {
@@ -126,6 +197,9 @@ final class RemoteController: ObservableObject {
     @Published private(set) var endpoint: String
     @Published private(set) var notice = ""
     @Published private(set) var sendingText = false
+    @Published private(set) var liveText = ""
+    @Published private(set) var textNeedsReset = false
+    @Published private(set) var waking = false
     @Published private(set) var fastMode = false
     @Published private(set) var latencyMS: Int?
     @Published var autoReconnect: Bool {
@@ -137,6 +211,16 @@ final class RemoteController: ObservableObject {
     private var generation = UUID()
     private var checking = false
     private var pendingNavigation = 0
+    private var liveAcknowledged = ""
+    private var liveSyncing = false
+    private var liveDebounce: DispatchWorkItem?
+    private var liveConfirm: ((Bool) -> Void)?
+    private var liveEnding = false
+    private var liveActions: [() -> Void] = []
+    // Only the first successful connection of a launch should wake the TV.
+    // Periodic checks must not undo an intentional sleep.
+    private var autoWakePending = true
+    private var openedWindow = false
     // Only the serial command queue accesses the channel or attempt timestamp.
     private var channel: FastChannel?
     private var lastFastAttempt: Date = .distantPast
@@ -169,8 +253,10 @@ final class RemoteController: ObservableObject {
     func configure(host: String, port: String) -> Bool {
         guard let target = ADB.endpoint(host, port) else { return false }
         generation = UUID()
+        resetLiveText()
         checking = false
         sendingText = false
+        waking = false
         pendingNavigation = 0
         fastMode = false
         latencyMS = nil
@@ -183,22 +269,39 @@ final class RemoteController: ObservableObject {
     func connect() { checkConnection(reconnect: true, showConnecting: true) }
     private func refresh() { checkConnection(reconnect: autoReconnect, showConnecting: false) }
 
+    func windowOpened() {
+        if !openedWindow { openedWindow = true; return }
+        // Closing and reopening the window without quitting the process also
+        // counts as opening the remote.
+        if state == .connected {
+            changePower(wakeOnly: true)
+        } else {
+            autoWakePending = true
+            connect()
+        }
+    }
+
     private func checkConnection(reconnect: Bool, showConnecting: Bool) {
         guard let adb else { state = .missingADB; return }
         guard !endpoint.isEmpty else { state = .disconnected; latencyMS = nil; return }
         guard !checking else { return }
         checking = true
         if showConnecting { state = .connecting; notice = "" }
-        let target = endpoint, token = generation
+        let target = endpoint, token = generation, wakeAtLaunch = autoWakePending
         queue.async { [weak self] in
             guard let self else { return }
             if let channel = self.channel, channel.target == target, case .ok(let milliseconds) = channel.request("P", timeout: 1) {
+                let wakeResult = wakeAtLaunch ? ADB.wake(adb, target: target) : nil
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.generation == token else { return }
                     self.checking = false
                     self.state = .connected
                     self.fastMode = true
                     self.latencyMS = Int(milliseconds.rounded())
+                    if let wakeResult {
+                        self.autoWakePending = false
+                        if wakeResult == .failed { self.notice = "No se pudo despertar la TV. Intenta con ⏻." }
+                    }
                 }
                 return
             }
@@ -211,12 +314,15 @@ final class RemoteController: ObservableObject {
                 result = ADB.run(adb, ["-s", target, "get-state"], timeout: 3)
             }
             let status: LinkState = result.output == "device" && result.ok ? .connected : ((result.output + connectionMessage).localizedCaseInsensitiveContains("unauthorized") || connectionMessage.localizedCaseInsensitiveContains("authenticate") ? .unauthorized : .disconnected)
+            // Wake immediately after authorization, before starting the fast
+            // channel or enabling the other remote controls.
+            let wakeResult = status == .connected && wakeAtLaunch ? ADB.wake(adb, target: target) : nil
             var measured: Int?
             if status == .connected && (showConnecting || Date().timeIntervalSince(self.lastFastAttempt) > 25) {
                 self.lastFastAttempt = Date()
                 self.channel = FastChannel.start(adb: adb, target: target)
                 if let channel = self.channel {
-                    if case .ok(let milliseconds) = channel.request("K 0") {
+                    if case .ok(let milliseconds) = channel.request("P") {
                         measured = Int(milliseconds.rounded())
                     } else { channel.close(); self.channel = nil }
                 }
@@ -236,11 +342,19 @@ final class RemoteController: ObservableObject {
                 self.fastMode = fast
                 self.latencyMS = latency
                 if status == .connected && (self.notice == "No se pudo enviar el comando." || self.notice == "Se perdió la conexión.") { self.notice = "" }
+                if let wakeResult {
+                    self.autoWakePending = false
+                    if wakeResult == .failed { self.notice = "No se pudo despertar la TV. Intenta con ⏻." }
+                }
             }
         }
     }
 
     func press(_ key: RemoteKey) {
+        finishLiveTextBefore { [weak self] in self?.sendNavigation(key) }
+    }
+
+    private func sendNavigation(_ key: RemoteKey) {
         // Limit queued directional input, never accumulate seconds of stale keys.
         guard state == .connected, pendingNavigation < (fastMode ? 8 : 2) else { return }
         pendingNavigation += 1
@@ -250,26 +364,155 @@ final class RemoteController: ObservableObject {
         }
     }
 
-    func sendText(_ value: String, confirm: Bool, completion: @escaping (Bool) -> Void) {
-        guard !sendingText, state == .connected else { completion(false); return }
-        let limited = String(value.prefix(500))
-        let prepared = ADB.textCommands(limited)
-        guard !prepared.commands.isEmpty else {
-            notice = "El texto no contiene caracteres compatibles."
-            completion(false)
+    func togglePower() {
+        finishLiveTextBefore { [weak self] in self?.changePower(wakeOnly: false) }
+    }
+
+    private func changePower(wakeOnly: Bool) {
+        guard let adb, state == .connected, !waking else { return }
+        waking = true
+        notice = ""
+        let target = endpoint, token = generation
+        queue.async { [weak self] in
+            let result = wakeOnly ? ADB.wake(adb, target: target) : ADB.togglePower(adb, target: target)
+            let stillConnected = result != .failed || ADB.run(adb, ["-s", target, "get-state"], timeout: 3).output == "device"
+            DispatchQueue.main.async {
+                guard let self, self.generation == token else { return }
+                self.waking = false
+                if result == .failed {
+                    self.notice = stillConnected ? "No se pudo cambiar el estado de la TV. Intenta nuevamente." : "Se perdió la conexión."
+                    if !stillConnected {
+                        self.state = .disconnected
+                        self.latencyMS = nil
+                    }
+                }
+            }
+        }
+    }
+
+    /// Coalesce very fast keystrokes, but flush word boundaries, pastes and
+    /// deletions immediately. At most one delta is in flight.
+    func updateLiveText(_ value: String) {
+        guard !liveEnding, liveConfirm == nil, !textNeedsReset else { return }
+        let previous = liveText
+        liveText = String(value.prefix(500))
+        guard liveText != previous else { return }
+        liveDebounce?.cancel()
+        guard state == .connected else {
+            failLiveText()
             return
         }
+        let boundary = liveText.last?.isWhitespace == true
+        let editing = liveText.count != previous.count + 1 || !liveText.hasPrefix(previous)
+        if boundary || editing {
+            flushLiveText()
+        } else {
+            let work = DispatchWorkItem { [weak self] in self?.flushLiveText() }
+            liveDebounce = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.045, execute: work)
+        }
+    }
+
+    func confirmLiveText(completion: @escaping (Bool) -> Void) {
+        guard !liveText.isEmpty, !textNeedsReset, !sendingText, !liveEnding, state == .connected else {
+            completion(false); return
+        }
         sendingText = true
-        let cmds = prepared.commands + (confirm ? ["input keyevent 66"] : [])
-        let encoded = Data(ADB.plainText(limited).utf8).base64EncodedString()
-        let fastCommands = ["T \(encoded)"] + (confirm ? ["K 66"] : [])
-        command(cmds, fastCommands: fastCommands, textJob: true) { [weak self] success in
-            guard let self else { completion(false); return }
-            self.sendingText = false
-            if success {
-                self.notice = prepared.changed ? "Enviado; se adaptaron algunos caracteres." : "Texto enviado."
+        liveConfirm = completion
+        liveDebounce?.cancel()
+        flushLiveText()
+    }
+
+    /// A navigation or power action must follow the last pending text update,
+    /// not race it into a different field. End the local session without
+    /// deleting anything from the TV.
+    private func finishLiveTextBefore(_ action: @escaping () -> Void) {
+        guard liveText.isEmpty && liveAcknowledged.isEmpty && !liveSyncing &&
+              liveConfirm == nil && !textNeedsReset && !liveEnding else {
+            guard liveActions.count < 8 else { return }
+            liveActions.append(action)
+            liveEnding = true
+            liveDebounce?.cancel()
+            flushLiveText()
+            return
+        }
+        action()
+    }
+
+    private func resetLiveText() {
+        liveDebounce?.cancel()
+        liveDebounce = nil
+        liveAcknowledged = ""
+        liveText = ""
+        liveSyncing = false
+        liveEnding = false
+        liveConfirm = nil
+        liveActions.removeAll()
+        sendingText = false
+        textNeedsReset = false
+        if notice == "No se pudo sincronizar. Abre otra búsqueda." { notice = "" }
+    }
+
+    private func completeLiveText(_ success: Bool) {
+        let completion = liveConfirm
+        let actions = liveActions
+        resetLiveText()
+        completion?(success)
+        actions.forEach { $0() }
+    }
+
+    private func failLiveText() {
+        // A timeout may mean the TV received a delta (or part of it). Never
+        // retry unacknowledged input: that could duplicate letters or words.
+        liveSyncing = false
+        textNeedsReset = true
+        notice = "No se pudo sincronizar. Abre otra búsqueda."
+        let completion = liveConfirm
+        liveConfirm = nil
+        sendingText = false
+        completion?(false)
+        if liveEnding { completeLiveText(false) }
+    }
+
+    private func flushLiveText() {
+        liveDebounce?.cancel()
+        liveDebounce = nil
+        guard !liveSyncing else { return }
+        if textNeedsReset {
+            if liveEnding { completeLiveText(false) }
+            return
+        }
+        guard state == .connected else { failLiveText(); return }
+        let desired = ADB.plainText(liveText)
+        let delta = ADB.textDelta(from: liveAcknowledged, to: desired)
+        if !delta.isEmpty {
+            var commands: [String] = []
+            var fastCommands: [String] = []
+            if delta.erase > 0 {
+                commands.append("input keyevent " + Array(repeating: "67", count: delta.erase).joined(separator: " "))
+                fastCommands.append("D \(delta.erase)")
             }
-            completion(success)
+            if !delta.append.isEmpty {
+                commands.append(contentsOf: ADB.textCommands(delta.append).commands)
+                fastCommands.append("T " + Data(delta.append.utf8).base64EncodedString())
+            }
+            liveSyncing = true
+            command(commands, fastCommands: fastCommands, textJob: true) { [weak self] success in
+                guard let self else { return }
+                self.liveSyncing = false
+                guard success else { self.failLiveText(); return }
+                // Advance the acknowledged snapshot only after the TV replies.
+                self.liveAcknowledged = desired
+                self.flushLiveText()
+            }
+        } else if liveConfirm != nil {
+            // Search text is already present and results update as it is typed.
+            // Fire TV's on-screen keyboard interprets KEYCODE_ENTER as a
+            // click on its focused character. Finishing locally must not
+            // send another key to the TV.
+            completeLiveText(true)
+        } else if liveEnding {
+            completeLiveText(true)
         }
     }
 

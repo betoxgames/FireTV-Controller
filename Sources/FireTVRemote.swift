@@ -33,18 +33,32 @@ struct FireTVRemoteApp: App {
         .defaultSize(width: 332, height: 490)
         .commands {
             CommandGroup(replacing: .newItem) { }
+            // Reserve Command-H for the remote instead of macOS Hide.
+            CommandGroup(replacing: .appVisibility) {
+                Button("Inicio") {
+                    if NSApp.keyWindow?.attachedSheet == nil { remote.press(.home) }
+                }
+                .keyboardShortcut("h", modifiers: .command)
+                .disabled(remote.state != .connected)
+                Divider()
+                Button("Ocultar aplicación") { NSApp.hide(nil) }
+                Button("Ocultar las demás") { NSApp.hideOtherApplications(nil) }
+                    .keyboardShortcut("h", modifiers: [.command, .option])
+                Button("Mostrar todas") { NSApp.unhideAllApplications(nil) }
+            }
         }
     }
 }
 
 struct RemoteView: View {
     @ObservedObject var remote: RemoteController
-    @State private var search = ""
+    private var search: String { remote.liveText }
     @State private var showSettings = false
     @State private var showDependency = false
     @State private var activeKey: RemoteKey?
     @State private var pulse = UUID()
     @State private var monitor: Any?
+    @State private var swallowedReturn: UInt16?
     @State private var lastRepeat: TimeInterval = 0
     @FocusState private var writing: Bool
 
@@ -77,7 +91,8 @@ struct RemoteView: View {
         .sheet(isPresented: $showDependency) { DependencySetup(remote: remote) }
         .onAppear {
             if monitor == nil {
-                monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                remote.windowOpened()
+                monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { event in
                     handle(event)
                 }
             }
@@ -88,11 +103,26 @@ struct RemoteView: View {
         .onDisappear {
             if let monitor { NSEvent.removeMonitor(monitor) }
             monitor = nil
+            swallowedReturn = nil
         }
     }
 
     private var header: some View {
         HStack(spacing: 9) {
+            Button {
+                stopWriting()
+                remote.togglePower()
+            } label: {
+                Image(systemName: "power")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(orange)
+                    .shadow(color: orange.opacity(0.38), radius: 4)
+                    .frame(width: 34, height: 34)
+            }
+            .buttonStyle(NeonButtonStyle(tint: orange, radius: 17, strength: 0.76, lit: remote.waking))
+            .disabled(!connected || remote.waking)
+            .help("Encender o poner la TV en reposo")
+            .accessibilityLabel("Encender o poner la TV en reposo")
             Button(action: {
                 if remote.state == .missingADB { showDependency = true }
                 else if remote.endpoint.isEmpty { showSettings = true }
@@ -177,8 +207,8 @@ struct RemoteView: View {
     private var shortcuts: some View {
         HStack(spacing: 25) {
             roundKey("Esc / ⌫", icon: "arrow.uturn.backward", key: .back, tint: peach, hint: "Atrás (Esc o Backspace)")
-            roundKey("Inicio", icon: "house", key: .home, tint: amber, hint: "Inicio")
-            roundKey("Menú", icon: "line.3.horizontal", key: .menu, tint: Color(red: 1, green: 0.57, blue: 0.14), hint: "Menú")
+            roundKey("⌘ + H", icon: "house", key: .home, tint: amber, hint: "Inicio (⌘ + H)")
+            roundKey("M", icon: "line.3.horizontal", key: .menu, tint: Color(red: 1, green: 0.57, blue: 0.14), hint: "Menú (M)")
         }
     }
 
@@ -202,16 +232,17 @@ struct RemoteView: View {
     private var typingCard: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                TextField("Escribir", text: $search, prompt: Text("Escribir").foregroundColor(muted.opacity(0.69)))
+                TextField("Escribir", text: Binding(get: { remote.liveText }, set: { remote.updateLiveText($0) }), prompt: Text("Escribir").foregroundColor(muted.opacity(0.69)))
                     .textFieldStyle(.plain)
                     .font(.system(size: 13))
                     .focused($writing)
-                    .onSubmit { send(confirm: true) }
+                    .onSubmit { finishSearch() }
+                    .disabled(!connected || remote.sendingText || remote.textNeedsReset)
                     .accessibilityLabel("Texto para TV")
                 if search.isEmpty {
-                    Text("⌘L").font(.system(size: 10, design: .monospaced)).foregroundStyle(muted.opacity(0.74))
+                    Text("⌘ + L").font(.system(size: 10, design: .monospaced)).foregroundStyle(muted.opacity(0.74))
                 }
-                Button { send(confirm: true) } label: {
+                Button { finishSearch() } label: {
                     Group {
                         if remote.sendingText { ProgressView().controlSize(.small) }
                         else { Image(systemName: "magnifyingglass").font(.system(size: 15, weight: .semibold)) }
@@ -220,14 +251,14 @@ struct RemoteView: View {
                     .frame(width: 30, height: 30)
                 }
                 .buttonStyle(NeonButtonStyle(tint: orange, radius: 15, strength: 0.72, disabledOpacity: 0.69))
-                .disabled(!connected || search.isEmpty || remote.sendingText)
-                .help("Envía el texto y pulsa Enter")
+                .disabled(!connected || search.isEmpty || remote.sendingText || remote.textNeedsReset)
+                .help("Finaliza la búsqueda y vuelve al mando")
                 .accessibilityLabel("Buscar")
             }
             .padding(.leading, 13).padding(.trailing, 6).padding(.vertical, 6)
             .background(Color.white.opacity(0.025), in: Capsule())
             .overlay(Capsule().strokeBorder(writing ? orange.opacity(0.76) : copper.opacity(0.40), lineWidth: 1))
-            .help("Escribir en un buscador de la TV (⌘L). Pulsa Enter o la lupa para buscar.")
+            .help("Escribe en tiempo real en el buscador de la TV (⌘ + L). Pulsa Enter o la lupa para confirmar.")
             if !remote.notice.isEmpty && remote.notice != "Texto enviado." {
                 Text(remote.notice).font(.system(size: 10)).foregroundStyle(muted)
                     .lineLimit(1)
@@ -247,12 +278,13 @@ struct RemoteView: View {
         }
     }
 
-    private func send(confirm: Bool) {
-        let value = search
-        guard !value.isEmpty, connected else { return }
-        remote.sendText(value, confirm: confirm) { success in
-            if success { if search == value { search = "" }; stopWriting() }
+    private func finishSearch() {
+        if !search.isEmpty && connected {
+            remote.confirmLiveText { _ in }
         }
+        // Release the local field immediately. Any outstanding text is
+        // flushed by RemoteController before subsequent navigation keys.
+        stopWriting()
     }
 
     private func stopWriting() {
@@ -263,17 +295,42 @@ struct RemoteView: View {
     }
 
     private func handle(_ event: NSEvent) -> NSEvent? {
+        let isReturn = event.keyCode == 36 || event.keyCode == 76
+        if event.type == .keyUp {
+            if isReturn && swallowedReturn == event.keyCode {
+                swallowedReturn = nil
+                return nil
+            }
+            return event
+        }
         guard NSApp.isActive, !showSettings, !showDependency, NSApp.keyWindow?.attachedSheet == nil else { return event }
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         if modifiers.contains(.command) {
             switch event.charactersIgnoringModifiers?.lowercased() {
             case "l": writing = true; return nil
+            case "h":
+                guard !modifiers.contains(.option), !modifiers.contains(.control), !modifiers.contains(.shift) else { return event }
+                if !event.isARepeat { press(.home) }
+                return nil
             case ",": stopWriting(); if remote.state == .missingADB { showDependency = true } else { showSettings = true }; return nil
             default: return event
             }
         }
         if modifiers.contains(.option) || modifiers.contains(.control) { return event }
-        if writing || NSApp.keyWindow?.firstResponder is NSTextView {
+        let inTextField = writing || NSApp.keyWindow?.firstResponder is NSTextView
+        if isReturn {
+            // Holding the Return key after focus changes must not produce OK.
+            if swallowedReturn == event.keyCode {
+                if event.isARepeat { return nil }
+                swallowedReturn = nil // a distinct press after a lost key-up
+            }
+            if inTextField || remote.sendingText {
+                swallowedReturn = event.keyCode
+                if !event.isARepeat && !remote.sendingText { finishSearch() }
+                return nil
+            }
+        }
+        if inTextField {
             if event.keyCode == 53 { stopWriting(); return nil }
             return event
         }
@@ -292,6 +349,7 @@ struct RemoteView: View {
             case "s": key = .down
             case "a": key = .left
             case "d": key = .right
+            case "m": key = .menu
             default: key = nil
             }
         }

@@ -4,7 +4,7 @@ import Darwin
 /// One persistent ADB shell. The helper reuses Fire OS's own input command;
 /// it has no listening network port and ends when the ADB stream closes.
 final class FastChannel {
-    static let remotePath = "/data/local/tmp/firetv-controller-v1.jar"
+    static let remotePath = "/data/local/tmp/firetv-controller-live-v4.jar"
     let target: String
     private let process = Process()
     private let input = Pipe()
@@ -31,7 +31,7 @@ final class FastChannel {
         }
         channel.process.terminationHandler = { [weak channel] _ in channel?.receive(Data()) }
         do { try channel.process.run() } catch { channel.close(); return nil }
-        guard channel.nextReply(timeout: 5) == "FIRETV_READY_2" else { channel.close(); return nil }
+        guard channel.nextReply(timeout: 5) == "FIRETV_READY_4" else { channel.close(); return nil }
         return channel
     }
 
@@ -43,7 +43,7 @@ final class FastChannel {
         while let newline = buffer.firstIndex(of: 10) {
             let line = String(decoding: buffer[..<newline], as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
             buffer.removeSubrange(...newline)
-            if ["FIRETV_READY_2", "FIRETV_OK", "FIRETV_ERROR"].contains(line) { replies.append(line) }
+            if ["FIRETV_READY_4", "FIRETV_OK", "FIRETV_ERROR"].contains(line) { replies.append(line) }
         }
         if buffer.count > 8192 { buffer.removeAll() }
     }

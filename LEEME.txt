@@ -1,4 +1,4 @@
-FIRETV CONTROLLER — v1.0.3
+FIRETV CONTROLLER — v1.1
 
 1. Descomprime esta descarga en tu Mac.
 2. Abre ControlRemoto.app. Si falta ADB, acepta la instalación desde la aplicación.
