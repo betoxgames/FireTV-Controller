@@ -13,9 +13,42 @@ struct ADBResult {
 }
 
 struct ADB {
+    static var installedLocation: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("FireTV Controller/platform-tools", isDirectory: true)
+    }
+
     static func find() -> String? {
-        let candidates = ["/opt/homebrew/bin/adb", "/usr/local/bin/adb", "/opt/homebrew/share/android-platform-tools/adb", "\(NSHomeDirectory())/Library/Android/sdk/platform-tools/adb"]
+        let candidates = ["/opt/homebrew/bin/adb", "/usr/local/bin/adb", "/opt/homebrew/share/android-platform-tools/adb", "\(NSHomeDirectory())/Library/Android/sdk/platform-tools/adb", installedLocation.appendingPathComponent("adb").path]
         return candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) })
+    }
+
+    // Called only after the user has explicitly accepted the Android SDK
+    // terms; downloads the official macOS package, without sudo.
+    static func install() -> String? {
+        if find() != nil { return nil }
+        let fm = FileManager.default
+        let temp = fm.temporaryDirectory.appendingPathComponent("firetv-tools-" + UUID().uuidString, isDirectory: true)
+        let archive = temp.appendingPathComponent("platform-tools.zip")
+        let destination = installedLocation
+        do {
+            try fm.createDirectory(at: temp, withIntermediateDirectories: false)
+            defer { try? fm.removeItem(at: temp) }
+            guard run("/usr/bin/curl", ["--fail", "--silent", "--show-error", "--location", "--proto", "=https", "--tlsv1.2", "--retry", "2", "https://dl.google.com/android/repository/platform-tools-latest-darwin.zip", "--output", archive.path], timeout: 180).ok else {
+                return "No se pudo descargar ADB. Comprueba tu conexión a internet."
+            }
+            guard run("/usr/bin/ditto", ["-x", "-k", archive.path, temp.path], timeout: 30).ok else { return "No se pudo descomprimir ADB." }
+            let extracted = temp.appendingPathComponent("platform-tools", isDirectory: true)
+            guard fm.isExecutableFile(atPath: extracted.appendingPathComponent("adb").path) else { return "La descarga no contiene un ADB válido." }
+            if fm.fileExists(atPath: destination.path) {
+                return find() == nil ? "Ya existe una instalación incompleta de ADB. Revisa la carpeta de herramientas." : nil
+            }
+            try fm.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try fm.moveItem(at: extracted, to: destination)
+            return find() == nil ? "No se pudo preparar ADB." : nil
+        } catch {
+            return "No se pudo instalar ADB. Comprueba el espacio y los permisos de tu Mac."
+        }
     }
 
     static func run(_ binary: String, _ args: [String], timeout: TimeInterval = 6) -> ADBResult {
@@ -99,7 +132,7 @@ final class RemoteController: ObservableObject {
         didSet { UserDefaults.standard.set(autoReconnect, forKey: "autoReconnect") }
     }
     private let queue = DispatchQueue(label: "mx.firetvremote.commands", qos: .userInitiated)
-    private let adb = ADB.find()
+    private var adb = ADB.find()
     private var timer: Timer?
     private var generation = UUID()
     private var checking = false
@@ -120,6 +153,18 @@ final class RemoteController: ObservableObject {
     }
 
     deinit { timer?.invalidate(); channel?.close() }
+
+    func installDependency(_ completion: @escaping (String?) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let error = ADB.install()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.adb = ADB.find()
+                if error == nil { self.connect() }
+                completion(error)
+            }
+        }
+    }
 
     func configure(host: String, port: String) -> Bool {
         guard let target = ADB.endpoint(host, port) else { return false }

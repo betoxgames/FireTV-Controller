@@ -1,9 +1,8 @@
-FIRETV CONTROLLER — v1.0
+FIRETV CONTROLLER — v1.0.1
 
 1. Descomprime esta descarga en tu Mac.
-2. Abre Instalar-dependencias.command para instalar ADB (si ya está instalado, no realiza cambios).
-3. Abre ControlRemoto.app.
-4. Pulsa el engrane, introduce la IP de tu propia TV y guarda.
+2. Abre ControlRemoto.app. Si falta ADB, acepta la instalación desde la aplicación.
+3. Pulsa el engrane, introduce la IP de tu propia TV y guarda.
 
 Requisitos: macOS 13 o posterior y depuración ADB autorizada en la TV;
 ambos dispositivos deben estar en la misma red.

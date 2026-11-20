@@ -41,6 +41,7 @@ struct RemoteView: View {
     @ObservedObject var remote: RemoteController
     @State private var search = ""
     @State private var showSettings = false
+    @State private var showDependency = false
     @State private var activeKey: RemoteKey?
     @State private var pulse = UUID()
     @State private var monitor: Any?
@@ -73,6 +74,7 @@ struct RemoteView: View {
         }
         .preferredColorScheme(.dark)
         .sheet(isPresented: $showSettings) { ConnectionSettings(remote: remote) }
+        .sheet(isPresented: $showDependency) { DependencySetup(remote: remote) }
         .onAppear {
             if monitor == nil {
                 monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
@@ -81,6 +83,7 @@ struct RemoteView: View {
             }
             // macOS otherwise gives the first text field initial keyboard focus.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { stopWriting() }
+            if remote.state == .missingADB { showDependency = true }
         }
         .onDisappear {
             if let monitor { NSEvent.removeMonitor(monitor) }
@@ -90,13 +93,17 @@ struct RemoteView: View {
 
     private var header: some View {
         HStack(spacing: 9) {
-            Button(action: { if remote.endpoint.isEmpty { showSettings = true } else { remote.connect() } }) {
+            Button(action: {
+                if remote.state == .missingADB { showDependency = true }
+                else if remote.endpoint.isEmpty { showSettings = true }
+                else { remote.connect() }
+            }) {
                 HStack(spacing: 7) {
                     Circle()
                         .fill(connected ? mint : redLED)
                         .frame(width: 7, height: 7)
                         .shadow(color: connected ? mint : redLED, radius: 5)
-                    Text(connected ? (remote.latencyMS.map { "\($0) ms" } ?? "— ms") : (remote.endpoint.isEmpty ? "Configurar" : remote.state.label))
+                    Text(connected ? (remote.latencyMS.map { "\($0) ms" } ?? "— ms") : (remote.state == .missingADB ? "Instalar ADB" : (remote.endpoint.isEmpty ? "Configurar" : remote.state.label)))
                         .font(.system(size: 11, weight: .medium, design: .monospaced))
                         .foregroundStyle(connected ? mint.opacity(0.90) : redLED.opacity(0.92))
                     if !connected && remote.state != .connecting {
@@ -114,7 +121,7 @@ struct RemoteView: View {
             Spacer()
             Button {
                 stopWriting()
-                showSettings = true
+                if remote.state == .missingADB { showDependency = true } else { showSettings = true }
             } label: {
                 Image(systemName: "gearshape").font(.system(size: 15, weight: .medium))
                     .foregroundStyle(muted)
@@ -256,12 +263,12 @@ struct RemoteView: View {
     }
 
     private func handle(_ event: NSEvent) -> NSEvent? {
-        guard NSApp.isActive, !showSettings, NSApp.keyWindow?.attachedSheet == nil else { return event }
+        guard NSApp.isActive, !showSettings, !showDependency, NSApp.keyWindow?.attachedSheet == nil else { return event }
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         if modifiers.contains(.command) {
             switch event.charactersIgnoringModifiers?.lowercased() {
             case "l": writing = true; return nil
-            case ",": stopWriting(); showSettings = true; return nil
+            case ",": stopWriting(); if remote.state == .missingADB { showDependency = true } else { showSettings = true }; return nil
             default: return event
             }
         }
@@ -379,6 +386,46 @@ private struct NeonButtonStyle: ButtonStyle {
             .opacity(enabled ? 1 : disabledOpacity)
             .animation(.easeOut(duration: 0.10), value: bright)
             .contentShape(RoundedRectangle(cornerRadius: radius))
+    }
+}
+
+struct DependencySetup: View {
+    @ObservedObject var remote: RemoteController
+    @Environment(\.dismiss) private var dismiss
+    @State private var installing = false
+    @State private var error = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Image(systemName: "arrow.down.circle")
+                .font(.system(size: 34, weight: .medium)).foregroundStyle(amber)
+            Text("Preparar conexión").font(.system(size: 23, weight: .bold, design: .rounded))
+            Text("Solo falta ADB. Se descargará desde el sitio oficial de Android y se instalará en tu carpeta de usuario.")
+                .foregroundStyle(muted).font(.system(size: 13)).fixedSize(horizontal: false, vertical: true)
+            Link("Términos de Android SDK", destination: URL(string: "https://developer.android.com/studio/terms")!)
+                .font(.system(size: 12)).foregroundStyle(amber)
+            if !error.isEmpty { Text(error).foregroundStyle(redLED).font(.system(size: 12)) }
+            if installing {
+                HStack(spacing: 10) {
+                    ProgressView().controlSize(.small)
+                    Text("Descargando e instalando…").font(.system(size: 12))
+                }
+            }
+            HStack {
+                Button("Cancelar") { dismiss() }.disabled(installing)
+                Spacer()
+                Button("Aceptar e instalar") {
+                    installing = true
+                    error = ""
+                    remote.installDependency { failure in
+                        installing = false
+                        if let failure { error = failure } else { dismiss() }
+                    }
+                }.keyboardShortcut(.defaultAction).disabled(installing).tint(accent)
+            }
+        }
+        .padding(24).frame(width: 345)
+        .interactiveDismissDisabled(installing)
     }
 }
 
