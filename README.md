@@ -6,4 +6,5 @@
 
 Requiere macOS 13 o posterior.
 
+Btw, por alguna razón el teclado de la app no sirve en Disney, en todo lo demás si debería de funcionar sin problemas :D
 lol
